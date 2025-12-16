@@ -30,7 +30,7 @@ def read_basic(f_path: str, sep: str = ' ', device: str = 'cpu'):
         shape = next(f).split(sep)
         n = int(shape[0])
         m = int(shape[1])
-        name = f_path.rsplit('/', 1)[1].rsplit('.', 1)[0]
+        name = os.path.splitext(os.path.basename(f_path))[0]
 
         # Load the instance
         instance = torch.empty((n, 2 * m), dtype=torch.float32, device=device)
@@ -40,15 +40,62 @@ def read_basic(f_path: str, sep: str = ' ', device: str = 'cpu'):
                 device=device
             )
 
-        # Load the makespan of a reference solution, if any
-        ms = 1.
-        try:
-            _ms = next(f)
-            if _ms != '':
-                ms = float(_ms)
-        except StopIteration:
-            pass
-    return name, n, m, instance, ms
+        # After the instance matrix there may be extra blocks:
+        # - a line with "-1" followed by stage_splits (one line per job)
+        # - a line with "-2" followed by due_dates (one line per job)
+        # - optionally a makespan line
+        stage_splits = None
+        due_dates = None
+        ms = 1.0
+
+        # Read remaining lines into a list for easier parsing
+        rem = [ln for ln in f]
+        rem = [ln.strip() for ln in rem if ln is not None]
+        idx = 0
+        # Look for "-1" marker
+        if idx < len(rem) and rem[idx] == '-1':
+            idx += 1
+            stage_splits = []
+            for j in range(n):
+                if idx >= len(rem):
+                    raise ValueError(f"Missing stage splits for job {j} in {f_path}")
+                parts = [int(x) for x in rem[idx].split() if x]
+                stage_splits.append(parts)
+                idx += 1
+
+        # Look for "-2" marker (due dates)
+        if idx < len(rem) and rem[idx] == '-2':
+            idx += 1
+            due_dates = []
+            for j in range(n):
+                if idx >= len(rem):
+                    raise ValueError(f"Missing due dates for job {j} in {f_path}")
+                parts = [int(x) for x in rem[idx].split() if x]
+                due_dates.append(parts)
+                idx += 1
+
+        # If any extra non-empty line remains, try parse it as makespan or a pair "makespan, tardy".
+        tardy_ref = None
+        while idx < len(rem) and rem[idx] == '':
+            idx += 1
+        if idx < len(rem):
+            s = rem[idx]
+            # normalize separators (comma or whitespace)
+            parts = [p for p in s.replace(',', ' ').split() if p]
+            try:
+                if len(parts) == 1:
+                    ms = float(parts[0])
+                elif len(parts) >= 2:
+                    ms = float(parts[0])
+                    try:
+                        tardy_ref = int(float(parts[1]))
+                    except Exception:
+                        tardy_ref = None
+            except Exception:
+                # not a parsable makespan, ignore
+                pass
+
+    return name, n, m, instance, ms, stage_splits, due_dates, tardy_ref
 
 
 def graph_edges(num_j: int, num_m: int, machines: torch.Tensor,
@@ -141,7 +188,7 @@ def load_data(path, device: str = 'cpu', sep: str = ' '):
         Dict containing the information about the instance
     """
     # Load the instance from the instance.jsp file
-    name, num_j, num_m, instance, ms = read_basic(path, sep, device)
+    name, num_j, num_m, instance, ms, stage_splits, due_dates, tardy_ref = read_basic(path, sep, device)
     costs = instance[:, 1::2]
     machines = instance[:, :-1:2].long()
 
@@ -160,8 +207,45 @@ def load_data(path, device: str = 'cpu', sep: str = ' '):
         edge_index=edges_t.t().contiguous(),
         costs=costs,        # Rows are jobs
         machines=machines,  # Rows are jobs
-        makespan=ms         # Optional
+        makespan=ms,        # Optional
+        stage_splits=stage_splits,
+        due_dates=due_dates,
+        tardy_ref=tardy_ref
     )
+    # If makespan is missing or left at default 1.0, compute a simple deterministic baseline
+    # by scheduling jobs in numerical order (job 0 then job1 ...) to produce a reference makespan.
+    try:
+        if data.get('makespan', None) is None or float(data['makespan']) <= 1.0:
+            num_jobs = data['j']
+            num_m = data['m']
+            job_ops = []
+            # reconstruct job_ops as list of (machine,ptime) from costs and machines
+            costs_mat = data['costs']
+            machines_mat = data['machines']
+            for j in range(num_jobs):
+                ops = []
+                for k in range(num_m):
+                    m = int(machines_mat[j, k].item())
+                    p = float(costs_mat[j, k].item())
+                    ops.append((m, p))
+                job_ops.append(ops)
+
+            # simple schedule: process jobs in order 0..n-1, each job's ops in order
+            machine_available = [0.0] * num_m
+            job_finish = [0.0] * num_jobs
+            for j in range(num_jobs):
+                for op_idx, (m, p) in enumerate(job_ops[j]):
+                    prev = job_finish[j]
+                    start = max(machine_available[m], prev)
+                    finish = start + p
+                    job_finish[j] = finish
+                    machine_available[m] = finish
+
+            baseline_ms = max(machine_available)
+            data['makespan'] = float(baseline_ms)
+    except Exception:
+        # If anything fails, leave makespan as-is
+        pass
     return data
 
 
@@ -218,7 +302,9 @@ def load_raw(path: str = './bachmarks/'):
 
         # Load the instance from the instance.jsp file
         f_path = os.path.join(path, file)
-        name, num_j, num_m, instance, ms = read_basic(f_path, device='cpu')
+        # read_basic may return extra fields (stage_splits, due_dates, tardy_ref)
+        res = read_basic(f_path, device='cpu')
+        name, num_j, num_m, instance, ms = res[0], res[1], res[2], res[3], res[4]
         costs = instance[:, 1::2]
         machines = instance[:, :-1:2].long()
 

@@ -74,7 +74,7 @@ if __name__ == '__main__':
 
     # Load the model
     print(f"Loading {args.model_path}")
-    enc_w, dec_ = torch.load(args.model_path, map_location=dev)
+    enc_w, dec_ = torch.load(args.model_path, map_location=dev, weights_only=False)
     enc_ = GATEncoder(15).to(dev)   # Load weights to avoid bug with new PyG
     enc_.load_state_dict(enc_w)
     m_name = args.model_path.rsplit('/', 1)[1].split('.', 1)[0]

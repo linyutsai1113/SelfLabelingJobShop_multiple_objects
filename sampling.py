@@ -1,5 +1,9 @@
 import torch
 import torch.nn.functional as F
+import os
+
+# Enable device debug prints when environment variable DEBUG_DEVICE=1
+DEBUG_DEVICE = os.getenv('DEBUG_DEVICE', '0') == '1'
 
 
 class JobShopStates:
@@ -58,6 +62,9 @@ class JobShopStates:
         #
         self.m_ct = torch.zeros((bs, self.num_m), dtype=torch.float32,
                                 device=self.dev)
+        # per-operation finish times (flattened ops: job * num_m + op)
+        self.op_finish = torch.zeros((bs, self.num_j * self.num_m), dtype=torch.float32,
+                         device=self.dev)
 
         # Create the initial state and mask
         states = torch.zeros((bs, self.num_j, self.size), dtype=torch.float32,
@@ -105,6 +112,10 @@ class JobShopStates:
                            self.j_ct[_idx, jobs]) + self.costs[_ops]
         self.m_ct[_idx, macs] = ct
         self.j_ct[_idx, jobs] = ct
+        # Record per-operation finish time
+        # _ops is a tensor of flattened op indices (num_j * num_m)
+        # ct has shape (bs,), assign to op_finish at positions _ops
+        self.op_finish[_idx, _ops] = ct
 
         # Activate the following operation on job, if any
         self.j_idx[_idx, jobs] += 1
@@ -140,6 +151,45 @@ class JobShopStates:
         n_states[..., 10] = mac_ct / curr_ms
 
         return n_states, self.mask.to(torch.float32)
+
+    def tardy_counts(self, stage_splits, due_dates):
+        """
+        Compute tardy stage-out counts per batch given stage_splits and due_dates.
+
+        Args:
+            stage_splits: list of lists, each inner list is splits for a job
+            due_dates: list of lists, due dates per job per stage
+        Return:
+            Tensor shape (bs,) with integer tardy counts per parallel state
+        """
+        # Use per-operation finish times to compute exact stage finishes
+        # op_finish is normalized; convert to real units
+        op_finish_real = self.op_finish * self._factor
+        bs = self.bs
+        num_j = self.num_j
+        num_m = self.num_m
+        tardy = torch.zeros((bs,), dtype=torch.long, device=self.dev)
+
+        for b in range(bs):
+            cnt = 0
+            for j in range(num_j):
+                splits = stage_splits[j]
+                # due_dates[j] is list with length = len(splits)-1
+                for s in range(len(splits)-1):
+                    st, ed = splits[s], splits[s+1]
+                    if st < ed:
+                        # global op indices for this job and stage
+                        ops_idx = [j * num_m + k for k in range(st, ed)]
+                        # gather finishes
+                        finishes = op_finish_real[b, ops_idx]
+                        stage_finish = float(finishes.max().item())
+                    else:
+                        stage_finish = 0.0
+                    if stage_finish > due_dates[j][s]:
+                        cnt += 1
+            tardy[b] = cnt
+
+        return tardy
 
     def __call__(self, jobs: torch.Tensor, states: torch.Tensor):
         """
@@ -225,7 +275,12 @@ def sampling(ins: dict,
 
     # Schedule last job/operation
     jsp(mask.float().argmax(-1), state)
-    return sols, jsp.makespan
+    # Compute tardy counts if instance provides stage info
+    if ins.get('stage_splits') is not None and ins.get('due_dates') is not None:
+        tardy = jsp.tardy_counts(ins['stage_splits'], ins['due_dates'])
+    else:
+        tardy = None
+    return sols, jsp.makespan, tardy
 
 
 @torch.no_grad()
@@ -278,7 +333,11 @@ def greedy(ins: dict,
 
     # Schedule last job/operation
     jsp(mask.float().argmax(-1), state)
-    return sols, jsp.makespan
+    if ins.get('stage_splits') is not None and ins.get('due_dates') is not None:
+        tardy = jsp.tardy_counts(ins['stage_splits'], ins['due_dates'])
+    else:
+        tardy = None
+    return sols, jsp.makespan, tardy
 
 
 def sample_training(ins: dict,
@@ -298,6 +357,7 @@ def sample_training(ins: dict,
     """
     encoder.train()
     decoder.train()
+
     num_j, num_m = ins['j'], ins['m']
     # We don't need to learn from the last step, everything is masked but a job
     num_ops = num_j * num_m - 1
@@ -332,4 +392,8 @@ def sample_training(ins: dict,
 
     # Schedule last job/operation
     jsp(mask.float().argmax(-1), state)
-    return trajs, ptrs, jsp.makespan
+    if ins.get('stage_splits') is not None and ins.get('due_dates') is not None:
+        tardy = jsp.tardy_counts(ins['stage_splits'], ins['due_dates'])
+    else:
+        tardy = None
+    return trajs, ptrs, jsp.makespan, tardy

@@ -14,6 +14,41 @@ device = 'cuda' if torch.cuda.is_available() else 'cpu'
 # Number of steps to wait before probing for improvements
 PROBE_EVERY = 2500
 
+# Select the best solution among sampled ones based on makespan and tardyness (objectives) 20251220 linyutsai
+def select_best(mss, tardy):
+    if tardy is None:
+        # Fallback to single-objective makespan selection
+        ms, argmin = mss.min(-1)
+        argmin = int(argmin.item())
+    else:
+        # Pareto-based selection (non-dominated set), tie-break by makespan
+        bs_samp = mss.shape[0]
+        nondom = []
+        for p in range(bs_samp):
+            dominated = False
+            for q in range(bs_samp):
+                if p == q:
+                    continue
+                # q dominates p?
+                if (mss[q] <= mss[p] and tardy[q] <= tardy[p]) and (mss[q] < mss[p] or tardy[q] < tardy[p]):
+                    dominated = True
+                    break
+            if not dominated:
+                nondom.append(p)
+        if len(nondom) == 0:
+            # numerical fallback
+            ms, argmin = mss.min(-1)
+            argmin = int(argmin.item())
+        elif len(nondom) == 1:
+            argmin = nondom[0]
+            ms = mss[argmin]
+        else:
+            # choose one with minimal makespan among nondominated
+            nd_mss = torch.stack([mss[p] for p in nondom])
+            rel = torch.argmin(nd_mss)
+            argmin = int(nondom[int(rel.item())])
+            ms = mss[argmin]
+    return ms, argmin
 
 @torch.no_grad()
 def validation(encoder: torch.nn.Module,
@@ -31,17 +66,23 @@ def validation(encoder: torch.nn.Module,
         num_sols: Number of solution to generate for each instance.
         seed: Random seed.
     """
-    if seed is not None:
+    if seed is not None: 
         torch.manual_seed(seed)
     encoder.eval()
     decoder.eval()
     gaps_ms = ObjMeter()
     gaps_td = ObjMeter()
+    losses = AverageMeter()
+    criterion = torch.nn.CrossEntropyLoss(reduction='mean')
 
     # For each instance in the benchmark
     for ins in val_set:
         # Sample multiple solutions
-        s, mss, tardy = stg.sampling(ins, encoder, decoder, bs=num_sols, device=device)
+        trajs, logits, mss, tardy = stg.sample_training(ins, encoder, decoder, bs=num_sols, device=device, training=False)
+
+        ms, argmin = select_best(mss, tardy)
+        loss = criterion(logits[argmin], trajs[argmin])
+        losses.update(loss.item())
 
         # Log info: report makespan gap
         if 'makespan' in ins and ins['makespan'] is not None:
@@ -61,6 +102,7 @@ def validation(encoder: torch.nn.Module,
     # Print stats
     avg_gap_ms = gaps_ms.avg
     avg_gap_td = gaps_td.avg
+    print(f"\t\tValidation: AVG Loss={losses.avg:.4f}")
     print(f"\t\tValidation: AVG Gap (makespan)={avg_gap_ms:.3f}")
     print(gaps_ms)
     if avg_gap_td > -9999:  # Only print if tardy gaps were tracked
@@ -109,7 +151,7 @@ def train(encoder: torch.nn.Module,
         csv_file = open(log_csv, 'a', newline='')
         csv_writer = csv.writer(csv_file)
         if new_file:
-            csv_writer.writerow(['epoch', 'step', 'phase', 'instance', 'selected_makespan', 'selected_tardy', 'ref_makespan', 'ref_tardy'])
+            csv_writer.writerow(['epoch', 'step', 'phase', 'instance', 'loss', 'selected_makespan', 'selected_tardy', 'ref_makespan', 'ref_tardy', 'is_better_makespan', 'is_better_tardy', 'is_better_both', 'is_equal_both', 'is_worse_both'])
     for epoch in range(epochs):
         losses = AverageMeter()
         gaps_ms = ObjMeter()  # makespan gap
@@ -124,43 +166,13 @@ def train(encoder: torch.nn.Module,
             trajs, logits, mss, tardy = stg.sample_training(ins, encoder, decoder, bs=num_sols, device=device)
 
             # Select pseudo-label among sampled solutions
-            if tardy is None:
-                # Fallback to single-objective makespan selection
-                ms, argmin = mss.min(-1)
-                argmin = int(argmin.item())
-            else:
-                # Pareto-based selection (non-dominated set), tie-break by makespan
-                bs_samp = mss.shape[0]
-                nondom = []
-                for p in range(bs_samp):
-                    dominated = False
-                    for q in range(bs_samp):
-                        if p == q:
-                            continue
-                        # q dominates p?
-                        if (mss[q] <= mss[p] and tardy[q] <= tardy[p]) and (mss[q] < mss[p] or tardy[q] < tardy[p]):
-                            dominated = True
-                            break
-                    if not dominated:
-                        nondom.append(p)
-                if len(nondom) == 0:
-                    # numerical fallback
-                    ms, argmin = mss.min(-1)
-                    argmin = int(argmin.item())
-                elif len(nondom) == 1:
-                    argmin = nondom[0]
-                    ms = mss[argmin]
-                else:
-                    # choose one with minimal makespan among nondominated
-                    nd_mss = torch.stack([mss[p] for p in nondom])
-                    rel = torch.argmin(nd_mss)
-                    argmin = int(nondom[int(rel.item())])
-                    ms = mss[argmin]
+            ms, argmin = select_best(mss, tardy)
 
             loss = c(logits[argmin], trajs[argmin])
+            loss_val = loss.item()
 
             # log info
-            losses.update(loss.item())
+            losses.update(loss_val)
             ms_val = ms.item()
             ref_ms = ins.get('makespan', 1.0)
             gap_ms = (ms_val / ref_ms - 1) * 100
@@ -176,16 +188,22 @@ def train(encoder: torch.nn.Module,
             # Virtual batching for managing without masking different sizes
             loss *= frac
             loss.backward()
+            
             # Log selected solution to CSV (training step)
             if csv_writer is not None:
                 try:
-                    sel_m = float(ms.item()) if hasattr(ms, 'item') else float(ms)
+                    sel_m = int(ms.item()) if hasattr(ms, 'item') else int(ms)
                 except Exception:
-                    sel_m = float(ms)
+                    sel_m = int(ms)
                 sel_t = int(tardy[argmin].item()) if (tardy is not None) else ''
-                ref_m = float(ins.get('makespan')) if ins.get('makespan') is not None else ''
+                ref_m = int(ins.get('makespan')) if ins.get('makespan') is not None else ''
                 ref_t = int(ins.get('tardy_ref')) if ins.get('tardy_ref') is not None else ''
-                csv_writer.writerow([epoch, idx, 'train', ins.get('name', ins.get('path', '')), sel_m, sel_t, ref_m, ref_t])
+                is_better_makespan = int(sel_m < ref_m and sel_t == ref_t) if ref_m != '' else '' 
+                is_better_tardy = int(sel_t < ref_t and sel_m == ref_m) if (ref_t != '' and sel_t != '') else ''
+                is_better_both = int((is_better_makespan and is_better_tardy) or (sel_m < ref_m and sel_t < ref_t)) if (is_better_makespan != '' and is_better_tardy != '') else ''
+                is_equal_both = int(((sel_m == ref_m) and (sel_t == ref_t)) or (sel_m < ref_m and sel_t > ref_t) or (sel_m > ref_m and sel_t < ref_t)) if (ref_m != '' and ref_t != '' and sel_t != '') else ''
+                is_worse_both = int(((sel_m > ref_m) and (sel_t > ref_t)) or (sel_m == ref_m and sel_t > ref_t) or (sel_m > ref_m and sel_t == ref_t)) if (ref_m != '' and ref_t != '' and sel_t != '')  else ''
+                csv_writer.writerow([epoch, idx, 'train', ins.get('name', ins.get('path', '')), loss_val, sel_m, sel_t, ref_m, ref_t, is_better_makespan, is_better_tardy, is_better_both, is_equal_both, is_worse_both])
             if cnt == virtual_bs or idx + 1 == size:
                 opti.step()
                 opti.zero_grad()
@@ -203,7 +221,8 @@ def train(encoder: torch.nn.Module,
         avg_gap_ms = gaps_ms.avg
         avg_gap_td = gaps_td.avg
         logger.train(epoch, avg_loss, avg_gap_ms)
-        print(f'\tEPOCH {epoch:02}: avg loss={losses.avg:.4f}')
+        print(f'\tEPOCH {epoch:02}:')
+        print(f"\t\tTrain: AVG Loss={avg_loss:.4f}")
         print(f"\t\tTrain: AVG Gap (makespan)={avg_gap_ms:2.3f}")
         print(gaps_ms)
         if avg_gap_td > -9999:  # Only print if tardy gaps were tracked
@@ -214,16 +233,22 @@ def train(encoder: torch.nn.Module,
         # Record validation multi-objective stats to CSV (no per-instance printing)
         if csv_writer is not None:
             for ins in val_set:
-                s, mss, tardy = stg.sampling(ins, encoder, decoder, bs=8, device=device)
-                try:
-                    min_idx = int(torch.argmin(mss).item())
-                except Exception:
-                    min_idx = 0
-                sel_m = float(mss[min_idx].item())
+                trajs, logits, mss, tardy = stg.sample_training(ins, encoder, decoder, bs=8, device=device, training=False)
+                
+                ms, argmin = select_best(mss, tardy)
+                val_loss = c(logits[argmin], trajs[argmin]).item()
+                
+                min_idx = argmin
+                sel_m = int(ms.item())
                 sel_t = int(tardy[min_idx].item()) if tardy is not None else ''
-                ref_m = float(ins.get('makespan')) if ins.get('makespan') is not None else ''
+                ref_m = int(ins.get('makespan')) if ins.get('makespan') is not None else ''
                 ref_t = int(ins.get('tardy_ref')) if ins.get('tardy_ref') is not None else ''
-                csv_writer.writerow([epoch, 'validation', 'val', ins.get('name', ins.get('path', '')), sel_m, sel_t, ref_m, ref_t])
+                is_better_makespan = int(sel_m < ref_m and sel_t == ref_t) if ref_m != '' else '' 
+                is_better_tardy = int(sel_t < ref_t and sel_m == ref_m) if (ref_t != '' and sel_t != '') else ''
+                is_better_both = int((is_better_makespan and is_better_tardy) or (sel_m < ref_m and sel_t < ref_t)) if (is_better_makespan != '' and is_better_tardy != '') else ''
+                is_equal_both = int(((sel_m == ref_m) and (sel_t == ref_t)) or (sel_m < ref_m and sel_t > ref_t) or (sel_m > ref_m and sel_t < ref_t)) if (ref_m != '' and ref_t != '' and sel_t != '') else ''
+                is_worse_both = int(((sel_m > ref_m) and (sel_t > ref_t)) or (sel_m == ref_m and sel_t > ref_t) or (sel_m > ref_m and sel_t == ref_t)) if (ref_m != '' and ref_t != '' and sel_t != '') else ''
+                csv_writer.writerow([epoch, 'validation', 'val', ins.get('name', ins.get('path', '')), val_loss, sel_m, sel_t, ref_m, ref_t, is_better_makespan, is_better_tardy, is_better_both, is_equal_both, is_worse_both])
         logger.validation(val_gap)
         if _best is None or val_gap < _best:
             _best = val_gap
@@ -233,12 +258,18 @@ def train(encoder: torch.nn.Module,
     # Close CSV file if opened
     if csv_file is not None:
         csv_file.close()
+        # Automatically plot loss curves
+        try:
+            from plot_loss import plot_curves
+            plot_curves(log_csv)
+        except Exception as e:
+            print(f"Could not plot loss curves: {e}")
 
 #
 parser = ArgumentParser(description='PointerNet arguments for the JSP')
 parser.add_argument("-data_path", type=str, default="./dataset5k",
                     required=False, help="Path to the training data.")
-parser.add_argument("-model_path", type=str, required=False,
+parser.add_argument("-model_path", type=str, required=False, 
                     default=None, help="Path to the model.")
 parser.add_argument("-enc_hidden", type=int, default=64, required=False,
                     help="Hidden size of the encoder.")
